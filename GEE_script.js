@@ -1,128 +1,349 @@
 // ==========================================
-// 1. DEFINE AREA AND TIME
+// IMPROVED URBAN CLIMATE RISK ANALYSIS
+// Research Question: Spatial misalignment of vegetation loss and extreme rainfall trends
 // ==========================================
-// var cityPoint = ee.Geometry.Point([106.8456, -6.2088]); // Jakarta (Change as needed)
 
-// OPTION B: Houston, USA (Sprawl, Frequent Hurricanes)
-// var cityPoint = ee.Geometry.Point([-95.3698, 29.7604]); 
+// ==========================================
+// 1. SETUP & CONFIGURATION
+// ==========================================
 
-// OPTION C: Nairobi, Kenya (Inland, Rapid Informal Expansion)
-// var cityPoint = ee.Geometry.Point([36.8219, -1.2921]); 
+// SELECT YOUR CITY (Comment out all except one)
+var cityPoint = ee.Geometry.Point([73.0479, 33.6844]);   // Islamabad, Pakistan
+// var cityPoint = ee.Geometry.Point([79.8612, 6.9271]);    // Colombo, Sri Lanka
+// var cityPoint = ee.Geometry.Point([72.8777, 19.0760]);   // Mumbai, India
+// var cityPoint = ee.Geometry.Point([101.6869, 3.1319]);   // Kuala Lumpur, Malaysia
+// var cityPoint = ee.Geometry.Point([120.1551, 30.2741]);  // Hangzhou, China
+// var cityPoint = ee.Geometry.Point([106.8456, -6.2088]);  // Jakarta, Indonesia
+// var cityPoint = ee.Geometry.Point([78.4867, 17.3850]);   // Hyderabad, India
 
-// OPTION D: Dhaka, Bangladesh (High Density, Deltaic)
-var cityPoint = ee.Geometry.Point([90.4125, 23.8103]);
+var cityName = 'Islamabad'; // UPDATE THIS WITH YOUR CITY NAME
+
 var roi = cityPoint.buffer(20000); 
 Map.centerObject(roi, 11);
-
-var startYear = 2000;
-var endYear = 2020;
+Map.addLayer(roi, {color: 'red'}, 'ROI Boundary');
 
 // ==========================================
-// 2. PREPARE RAINFALL DATA (Climate Driver)
+// 2. DATA LOADING
 // ==========================================
-var rainCollection = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
-  .filterDate(startYear + '-01-01', endYear + '-12-31')
-  .filterBounds(roi);
 
-var annualMaxRain = ee.List.sequence(startYear, endYear).map(function(year) {
-  var startDate = ee.Date.fromYMD(year, 1, 1);
-  var maxRain = rainCollection.filterDate(startDate, startDate.advance(1, 'year')).max();
-  // FIX: Added .float() to ensure all images have the same data type
-  return maxRain.addBands(ee.Image.constant(year).rename('year').float())
-                .set('system:time_start', startDate.millis());
+var chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY");
+var modis = ee.ImageCollection("MODIS/061/MOD13Q1");
+var popImage = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").select('population_count');
+
+// ==========================================
+// 3. IMPROVED TREND CALCULATIONS
+// ==========================================
+
+var years = ee.List.sequence(2000, 2020);
+
+// --- Rainfall Trend (Using consistent scale) ---
+var rainColl = ee.ImageCollection(years.map(function(y) {
+  var annual = chirps.filter(ee.Filter.calendarRange(y, y, 'year'))
+    .reduce(ee.Reducer.percentile([95])).rename('rain');
+  var time = ee.Image.constant(y).toFloat().rename('t');
+  return ee.Image.cat([time, annual]).set('year', y);
+}));
+
+var rainTrend = rainColl.reduce(ee.Reducer.linearFit()).select('scale');
+
+// --- Vegetation Trend (with Quality Filtering) ---
+var ndviColl = modis.filterDate('2000-01-01', '2020-12-31')
+  .filterBounds(roi)
+  .map(function(img) {
+    // Quality filtering: Use only reliable pixels
+    var qa = img.select('SummaryQA');
+    var goodQuality = qa.eq(0); // 0 = good quality
+    
+    // CRITICAL: Scale NDVI from integer (0-10000) to float (0-1)
+    var ndvi = img.select('NDVI').multiply(0.0001).updateMask(goodQuality);
+    
+    var date = img.date();
+    var year = date.get('year');
+    var frac = date.getFraction('year');
+    var time = ee.Image(year).add(frac).toFloat().rename('t');
+    
+    return ee.Image.cat([time, ndvi]);
+  });
+
+var ndviTrend = ndviColl.reduce(ee.Reducer.linearFit()).select('scale');
+
+// ==========================================
+// 4. NORMALIZE TO COMMON GRID (500m)
+// ==========================================
+
+// Reproject both trends to a common 500m grid to avoid scale mismatches
+var projection = ee.Projection('EPSG:4326').atScale(500);
+
+var rainTrendResampled = rainTrend.reproject({
+  crs: projection,
+  scale: 500
 });
 
-var rainTrend = ee.ImageCollection(annualMaxRain).select(['year', 'precipitation']).reduce(ee.Reducer.linearFit());
-
-// ==========================================
-// 3. PREPARE VEGETATION DATA (Development Driver)
-// ==========================================
-var ndviCollection = ee.ImageCollection("MODIS/006/MOD13Q1")
-  .filterDate(startYear + '-01-01', endYear + '-12-31');
-
-var annualMeanNDVI = ee.List.sequence(startYear, endYear).map(function(year) {
-  var startDate = ee.Date.fromYMD(year, 1, 1);
-  var meanNDVI = ndviCollection.filterDate(startDate, startDate.advance(1, 'year')).mean().multiply(0.0001);
-  // FIX: Added .float() here as well
-  return meanNDVI.addBands(ee.Image.constant(year).rename('year').float())
-                .set('system:time_start', startDate.millis());
+var ndviTrendResampled = ndviTrend.reproject({
+  crs: projection,
+  scale: 500
 });
 
-var ndviTrend = ee.ImageCollection(annualMeanNDVI).select(['year', 'NDVI']).reduce(ee.Reducer.linearFit());
-
-// ==========================================
-// 4. POPULATION DATA
-// ==========================================
-// Load WorldPop data for 2020
-var pop = ee.ImageCollection("WorldPop/GP/100m/pop")
-  .filterDate('2020-01-01', '2020-12-31')
-  .first()
-  .clip(roi);
-
-// ==========================================
-// 5. VISUALIZATION
-// ==========================================
-Map.addLayer(pop, {min: 0, max: 50, palette: ['white', 'purple']}, 'Population Density (2020)', false);
-Map.addLayer(rainTrend.select('scale').clip(roi), {min: -0.5, max: 0.5, palette: ['white', 'blue']}, 'Rainfall Trend (Blue = Increasing)');
-Map.addLayer(ndviTrend.select('scale').clip(roi), {min: -0.005, max: 0.005, palette: ['red', 'white', 'green']}, 'NDVI Trend (Red = Urbanizing)');
-
-// ==========================================
-// 6. THE SCATTER PLOT
-// ==========================================
-var combined = rainTrend.select('scale').rename('Rain_Trend')
-  .addBands(ndviTrend.select('scale').rename('NDVI_Trend'));
-
-var samples = combined.sample({
-  region: roi,
-  scale: 1000,
-  numPixels: 500, 
-  geometries: true
+var popResampled = popImage.reproject({
+  crs: projection,
+  scale: 500
 });
 
-var chart = ui.Chart.feature.byFeature({
-  features: samples,
-  xProperty: 'NDVI_Trend',
-  yProperties: ['Rain_Trend']
-})
-.setChartType('ScatterChart')
-.setOptions({
-  title: 'Urbanization vs. Rainfall Intensity Trend',
-  hAxis: {title: 'Vegetation Trend (Left = Urbanization/Loss)'},
-  vAxis: {title: 'Rain Trend (Top = Intensity Increase)'},
-  pointSize: 3,
-  trendlines: { 0: {showR2: true, color: 'black'} },
-  series: { 0: {color: 'red'} }
+// ==========================================
+// 5. IMPROVED SAMPLING WITH CONSISTENT SCALE
+// ==========================================
+
+var rawSamples = ee.FeatureCollection.randomPoints(roi, 500);
+
+// Sample all layers at the SAME scale (500m)
+var samples = rawSamples.map(function(f) {
+  var r = rainTrendResampled.reduceRegion({
+    reducer: ee.Reducer.mean(), 
+    geometry: f.geometry(), 
+    scale: 500,
+    bestEffort: true
+  }).get('scale');
+  
+  var n = ndviTrendResampled.reduceRegion({
+    reducer: ee.Reducer.mean(), 
+    geometry: f.geometry(), 
+    scale: 500,
+    bestEffort: true
+  }).get('scale');
+  
+  var p = popResampled.reduceRegion({
+    reducer: ee.Reducer.mean(), 
+    geometry: f.geometry(), 
+    scale: 500,
+    bestEffort: true
+  }).get('population_count');
+  
+  return f.set({
+    'Rain_Trend': r, 
+    'NDVI_Trend': n, 
+    'Pop': p
+  });
 });
 
-// Calculate the correlation coefficient (r) with the correct function name
-var correlation = samples.reduceColumns({
-  reducer: ee.Reducer.pearsonsCorrelation(), // Added the 's'
+// Remove nulls
+var validSamples = samples.filter(ee.Filter.notNull(['Rain_Trend', 'NDVI_Trend', 'Pop']));
+
+print('====================================');
+print('SAMPLING DIAGNOSTICS');
+print('====================================');
+print('Total Points Generated:', rawSamples.size());
+print('Valid Points after Sampling:', validSamples.size());
+print('First Sample Point (Debug):', samples.first());
+
+// ==========================================
+// 6. NORMALIZATION FOR RISK SCORING
+// ==========================================
+
+// Get min/max for normalization
+var rainStats = validSamples.aggregate_stats('Rain_Trend');
+var ndviStats = validSamples.aggregate_stats('NDVI_Trend');
+var popStats = validSamples.aggregate_stats('Pop');
+
+print('====================================');
+print('DATA DISTRIBUTION STATISTICS');
+print('====================================');
+print('Rainfall Trend Stats:', rainStats);
+print('NDVI Trend Stats:', ndviStats);
+print('Population Stats:', popStats);
+
+// ==========================================
+// 7. ENHANCED RISK ANALYSIS
+// ==========================================
+
+var exposureRisk = validSamples.map(function(f) {
+  var rain = ee.Number(f.get('Rain_Trend'));
+  var ndvi = ee.Number(f.get('NDVI_Trend'));
+  var pop = ee.Number(f.get('Pop'));
+  
+  // Normalized hazard (rainfall increase)
+  var hazard = rain.max(0);
+  
+  // Normalized vulnerability (vegetation loss)
+  var vulnerability = ndvi.multiply(-1).max(0);
+  
+  // Only calculate risk if BOTH hazard AND vulnerability exist
+  var hasRisk = hazard.gt(0).and(vulnerability.gt(0));
+  
+  // Risk score - only non-zero when both conditions met
+  var score = ee.Algorithms.If(
+    hasRisk,
+    hazard.multiply(vulnerability).multiply(pop).multiply(10000000), // Increased multiplier for visibility
+    0
+  );
+  
+  return f.set('Risk_Score', score);
+});
+
+// ==========================================
+// 8. QUADRANT ANALYSIS (H1 Testing)
+// ==========================================
+
+var quadrantAnalysis = exposureRisk.map(function(f) {
+  var rain = ee.Number(f.get('Rain_Trend'));
+  var ndvi = ee.Number(f.get('NDVI_Trend'));
+  
+  var quadrant = ee.Algorithms.If(
+    rain.gt(0),
+    ee.Algorithms.If(ndvi.lt(0), 'High_Risk_Aligned', 'Rain_Increase_Only'),
+    ee.Algorithms.If(ndvi.lt(0), 'Veg_Loss_Only', 'Low_Change')
+  );
+  
+  return f.set('Quadrant', quadrant);
+});
+
+var quadrantCounts = quadrantAnalysis.aggregate_histogram('Quadrant');
+
+// Calculate percentages
+var totalPoints = exposureRisk.size();
+var alignedPoints = quadrantAnalysis.filter(ee.Filter.eq('Quadrant', 'High_Risk_Aligned'));
+var percentAligned = ee.Number(alignedPoints.size()).divide(totalPoints).multiply(100);
+
+// ==========================================
+// 9. CORRELATION ANALYSIS
+// ==========================================
+
+// Standard Pearson correlation
+var correlation = exposureRisk.reduceColumns({
+  reducer: ee.Reducer.pearsonsCorrelation(),
   selectors: ['NDVI_Trend', 'Rain_Trend']
+}).get('correlation');
+
+// Population-weighted correlation - Fixed
+// First filter points with population > 0 to avoid division issues
+var populatedPoints = exposureRisk.filter(ee.Filter.gt('Pop', 0));
+
+// Calculate population-weighted means
+var weightedRainMean = populatedPoints.reduceColumns({
+  reducer: ee.Reducer.mean(),
+  selectors: ['Rain_Trend'],
+  weightSelectors: ['Pop']
+}).get('mean');
+
+var weightedNdviMean = populatedPoints.reduceColumns({
+  reducer: ee.Reducer.mean(),
+  selectors: ['NDVI_Trend'],
+  weightSelectors: ['Pop']
+}).get('mean');
+
+var popWeightedStats = ee.Dictionary({
+  'weighted_rain_mean': weightedRainMean,
+  'weighted_ndvi_mean': weightedNdviMean
 });
 
-print('--- STATISTICAL RESULTS ---');
-print('Pearson Correlation (r):', correlation.get('correlation'));
+// ==========================================
+// 10. POPULATION EXPOSURE METRICS (H2)
+// ==========================================
 
-// Calculate R-squared (R2)
-var r2 = ee.Number(correlation.get('correlation')).pow(2);
-print('R-squared (R2):', r2);
+// Total population in high-risk areas
+var highRiskPop = alignedPoints.aggregate_sum('Pop');
+var totalPop = exposureRisk.aggregate_sum('Pop');
+var percentPopExposed = ee.Number(highRiskPop).divide(totalPop).multiply(100);
 
-print('--- FINAL ANALYSIS ---');
+// Cumulative risk score
+var cumulativeRisk = exposureRisk.aggregate_sum('Risk_Score');
+
+// Average risk per capita in high-risk zones
+var avgRiskHighZones = alignedPoints.aggregate_mean('Risk_Score');
+
+// ==========================================
+// 11. COMPREHENSIVE RESULTS OUTPUT
+// ==========================================
+
+print('====================================');
+print('FINAL RESULTS: ' + cityName);
+print('====================================');
+print('');
+print('--- H1: SPATIAL MISALIGNMENT ANALYSIS ---');
+print('Pearson Correlation (r):', correlation);
+print('Interpretation: r < 0.3 = Strong misalignment, r > 0.6 = Strong alignment');
+print('Quadrant Distribution:', quadrantCounts);
+print('% Points in High-Risk Aligned Zone:', percentAligned);
+print('');
+print('--- H2: POPULATION EXPOSURE ANALYSIS ---');
+print('Total Population in Study Area:', totalPop);
+print('Population in High-Risk Zones:', highRiskPop);
+print('% Population Exposed to Aligned Risk:', percentPopExposed);
+print('Cumulative Risk Score (City-wide):', cumulativeRisk);
+print('Average Risk Score in High-Risk Zones:', avgRiskHighZones);
+print('');
+print('--- ADDITIONAL METRICS ---');
+print('Population-Weighted Regression:', popWeightedStats);
+print('Total Area (km²):', roi.area().divide(1000000));
+
+// ==========================================
+// 12. VISUALIZATION
+// ==========================================
+
+// Trend layers
+Map.addLayer(rainTrendResampled.clip(roi), 
+  {min: -0.1, max: 0.1, palette: ['blue', 'white', 'red']}, 
+  'Rainfall Trend (mm/year)');
+
+Map.addLayer(ndviTrendResampled.clip(roi), 
+  {min: -0.001, max: 0.001, palette: ['brown', 'white', 'green']}, 
+  'NDVI Trend (per year)');
+
+Map.addLayer(popResampled.clip(roi), 
+  {min: 0, max: 1000, palette: ['white', 'yellow', 'orange', 'red']}, 
+  'Population Density');
+
+// Scatter plot with quadrants
+var chart = ui.Chart.feature.byFeature(quadrantAnalysis, 'NDVI_Trend', 'Rain_Trend')
+  .setSeriesNames(['Data Points'])
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: cityName + ': Spatial Misalignment Analysis',
+    hAxis: {
+      title: 'Vegetation Trend (Loss < 0 > Gain)',
+      viewWindow: {min: -0.002, max: 0.002}
+    },
+    vAxis: {
+      title: 'Extreme Rainfall Trend (Decrease < 0 > Increase)',
+      viewWindow: {min: -0.2, max: 0.4}
+    },
+    pointSize: 3,
+    series: {0: {color: 'red'}},
+    trendlines: {0: {color: 'blue', lineWidth: 2, opacity: 0.5}}
+  });
+
+print('');
+print('--- VISUALIZATION ---');
 print(chart);
 
+// Risk distribution histogram - Filter out zeros for better visualization
+var nonZeroRisk = exposureRisk.filter(ee.Filter.gt('Risk_Score', 0));
+
+var riskChart = ui.Chart.feature.histogram(nonZeroRisk, 'Risk_Score', 30)
+  .setOptions({
+    title: cityName + ': Distribution of Risk Scores (Non-Zero Only)',
+    hAxis: {title: 'Risk Score'},
+    vAxis: {title: 'Frequency'},
+    colors: ['#d62728']
+  });
+
+print(riskChart);
+
+// Also print count of zero vs non-zero
+print('Points with Zero Risk:', exposureRisk.filter(ee.Filter.eq('Risk_Score', 0)).size());
+print('Points with Non-Zero Risk:', nonZeroRisk.size());
+
 // ==========================================
-// 6. QUANTIFYING ALIGNMENT VS MISALIGNMENT
+// 13. EXPORT READY SUMMARY
 // ==========================================
 
-// Define the quadrants
-var dangerZone = samples.filter(ee.Filter.and(
-  ee.Filter.lt('NDVI_Trend', 0), 
-  ee.Filter.gt('Rain_Trend', 0)
-));
-
-var totalPoints = samples.size();
-var dangerPoints = dangerZone.size();
-var alignmentPct = ee.Number(dangerPoints).divide(totalPoints).multiply(100);
-
-print('--- COMPARISON METRICS ---');
-print('Percentage of Aligned Risk (Top-Left Quadrant) %:', alignmentPct);
+print('====================================');
+print('COPY THIS FOR YOUR CROSS-CITY TABLE:');
+print('====================================');
+print('City: ' + cityName);
+print('Correlation (r): ' + correlation.getInfo());
+print('% Aligned Risk (Area): ' + percentAligned.getInfo().toFixed(2) + '%');
+print('Cumulative Risk Score: ' + cumulativeRisk.getInfo().toFixed(0));
+print('Rain Trend SD: ' + rainStats.get('sample_sd').getInfo().toFixed(4));
+print('% Population Exposed: ' + percentPopExposed.getInfo().toFixed(2) + '%');
+print('Avg Risk in High-Risk Zones: ' + avgRiskHighZones.getInfo().toFixed(0));
+print('====================================');
