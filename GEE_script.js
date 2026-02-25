@@ -1,22 +1,18 @@
-// ==========================================
-// IMPROVED URBAN CLIMATE RISK ANALYSIS
-// Research Question: Spatial misalignment of vegetation loss and extreme rainfall trends
-// ==========================================
 
 // ==========================================
 // 1. SETUP & CONFIGURATION
 // ==========================================
 
 // SELECT YOUR CITY (Comment out all except one)
-var cityPoint = ee.Geometry.Point([73.0479, 33.6844]);   // Islamabad, Pakistan
+// var cityPoint = ee.Geometry.Point([73.0479, 33.6844]);   // Islamabad, Pakistan
 // var cityPoint = ee.Geometry.Point([79.8612, 6.9271]);    // Colombo, Sri Lanka
 // var cityPoint = ee.Geometry.Point([72.8777, 19.0760]);   // Mumbai, India
-// var cityPoint = ee.Geometry.Point([101.6869, 3.1319]);   // Kuala Lumpur, Malaysia
+var cityPoint = ee.Geometry.Point([101.6869, 3.1319]);   // Kuala Lumpur, Malaysia
 // var cityPoint = ee.Geometry.Point([120.1551, 30.2741]);  // Hangzhou, China
 // var cityPoint = ee.Geometry.Point([106.8456, -6.2088]);  // Jakarta, Indonesia
 // var cityPoint = ee.Geometry.Point([78.4867, 17.3850]);   // Hyderabad, India
 
-var cityName = 'Islamabad'; // UPDATE THIS WITH YOUR CITY NAME
+var cityName = 'Kuala Lumpur'; // UPDATE THIS WITH YOUR CITY NAME
 
 var roi = cityPoint.buffer(20000); 
 Map.centerObject(roi, 11);
@@ -29,6 +25,14 @@ Map.addLayer(roi, {color: 'red'}, 'ROI Boundary');
 var chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY");
 var modis = ee.ImageCollection("MODIS/061/MOD13Q1");
 var popImage = ee.Image("JRC/GHSL/P2023A/GHS_POP/2020").select('population_count');
+
+// CRITIQUE 2 FIX: Add Impervious Surface data (Built-up area)
+// This better captures "absorption capacity loss" than NDVI alone
+var builtUp2000 = ee.Image("JRC/GHSL/P2023A/GHS_BUILT_S/2000").select('built_surface');
+var builtUp2020 = ee.Image("JRC/GHSL/P2023A/GHS_BUILT_S/2020").select('built_surface');
+
+// Calculate built-up change (proxy for imperviousness increase)
+var builtUpChange = builtUp2020.subtract(builtUp2000).divide(20); // Per year trend
 
 // ==========================================
 // 3. IMPROVED TREND CALCULATIONS
@@ -89,6 +93,32 @@ var popResampled = popImage.reproject({
   scale: 500
 });
 
+var builtUpChangeResampled = builtUpChange.reproject({
+  crs: projection,
+  scale: 500
+});
+
+// ==========================================
+// SPATIAL RESOLUTION ANALYSIS
+// ==========================================
+
+// Calculate effective number of independent rainfall pixels
+var roiArea = roi.area().divide(1000000); // km²
+var chirpsPixelArea = 5.5 * 5.5; // km² per CHIRPS pixel
+var effectiveRainPixels = roiArea.divide(chirpsPixelArea);
+
+print('====================================');
+print('SPATIAL RESOLUTION ANALYSIS');
+print('====================================');
+print('Study Area (km²):', roiArea);
+print('CHIRPS Native Resolution: ~5.5km');
+print('Effective CHIRPS Pixels in ROI:', effectiveRainPixels);
+print('MODIS NDVI Resolution: 250m');
+print('Interpretation: Rainfall data represents ~' + effectiveRainPixels.getInfo().toFixed(0) + 
+      ' independent observations across the city.');
+print('WARNING: Low spatial resolution may capture regional gradients rather than intra-urban variation.');
+print('');
+
 // ==========================================
 // 5. IMPROVED SAMPLING WITH CONSISTENT SCALE
 // ==========================================
@@ -118,15 +148,24 @@ var samples = rawSamples.map(function(f) {
     bestEffort: true
   }).get('population_count');
   
+  //Add built-up change as alternative absorption proxy
+  var b = builtUpChangeResampled.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: f.geometry(),
+    scale: 500,
+    bestEffort: true
+  }).get('built_surface');
+  
   return f.set({
     'Rain_Trend': r, 
     'NDVI_Trend': n, 
-    'Pop': p
+    'Pop': p,
+    'BuiltUp_Change': b
   });
 });
 
 // Remove nulls
-var validSamples = samples.filter(ee.Filter.notNull(['Rain_Trend', 'NDVI_Trend', 'Pop']));
+var validSamples = samples.filter(ee.Filter.notNull(['Rain_Trend', 'NDVI_Trend', 'Pop', 'BuiltUp_Change']));
 
 print('====================================');
 print('SAMPLING DIAGNOSTICS');
@@ -143,13 +182,17 @@ print('First Sample Point (Debug):', samples.first());
 var rainStats = validSamples.aggregate_stats('Rain_Trend');
 var ndviStats = validSamples.aggregate_stats('NDVI_Trend');
 var popStats = validSamples.aggregate_stats('Pop');
+var builtUpStats = validSamples.aggregate_stats('BuiltUp_Change');
 
 print('====================================');
 print('DATA DISTRIBUTION STATISTICS');
 print('====================================');
 print('Rainfall Trend Stats:', rainStats);
-print('NDVI Trend Stats:', ndviStats);
+print('NDVI Trend Stats (Vegetation Greenness):', ndviStats);
+print('Built-Up Change Stats (Imperviousness):', builtUpStats);
 print('Population Stats:', popStats);
+print('NOTE: Built-up increase = direct loss of absorption capacity');
+print('');
 
 // ==========================================
 // 7. ENHANCED RISK ANALYSIS
@@ -207,13 +250,19 @@ var percentAligned = ee.Number(alignedPoints.size()).divide(totalPoints).multipl
 // 9. CORRELATION ANALYSIS
 // ==========================================
 
-// Standard Pearson correlation
+// Standard Pearson correlation (NDVI-based)
 var correlation = exposureRisk.reduceColumns({
   reducer: ee.Reducer.pearsonsCorrelation(),
   selectors: ['NDVI_Trend', 'Rain_Trend']
 }).get('correlation');
 
-// Population-weighted correlation - Fixed
+// Alternative correlation using Built-Up Change
+var correlationBuiltUp = exposureRisk.reduceColumns({
+  reducer: ee.Reducer.pearsonsCorrelation(),
+  selectors: ['BuiltUp_Change', 'Rain_Trend']
+}).get('correlation');
+
+// Population-weighted correlation
 // First filter points with population > 0 to avoid division issues
 var populatedPoints = exposureRisk.filter(ee.Filter.gt('Pop', 0));
 
@@ -259,10 +308,12 @@ print('FINAL RESULTS: ' + cityName);
 print('====================================');
 print('');
 print('--- H1: SPATIAL MISALIGNMENT ANALYSIS ---');
-print('Pearson Correlation (r):', correlation);
+print('Pearson Correlation - NDVI (r):', correlation);
+print('Pearson Correlation - Built-Up (r):', correlationBuiltUp);
 print('Interpretation: r < 0.3 = Strong misalignment, r > 0.6 = Strong alignment');
 print('Quadrant Distribution:', quadrantCounts);
 print('% Points in High-Risk Aligned Zone:', percentAligned);
+print('NOTE: Built-up correlation shows imperviousness vs rainfall alignment');
 print('');
 print('--- H2: POPULATION EXPOSURE ANALYSIS ---');
 print('Total Population in Study Area:', totalPop);
@@ -291,6 +342,10 @@ Map.addLayer(ndviTrendResampled.clip(roi),
 Map.addLayer(popResampled.clip(roi), 
   {min: 0, max: 1000, palette: ['white', 'yellow', 'orange', 'red']}, 
   'Population Density');
+
+Map.addLayer(builtUpChangeResampled.clip(roi),
+  {min: 0, max: 5, palette: ['white', 'gray', 'black']},
+  'Built-Up Change (2000-2020)');
 
 // Scatter plot with quadrants
 var chart = ui.Chart.feature.byFeature(quadrantAnalysis, 'NDVI_Trend', 'Rain_Trend')
